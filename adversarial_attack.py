@@ -21,7 +21,9 @@ from utils.misc import save_checkpoint, AverageMeter
 from progress.bar import Bar as Bar
 import matplotlib.pyplot as plt
 
-from sklearn.metrics import precision_recall_fscore_support
+import torchattacks
+
+from sklearn.metrics import precision_recall_fscore_support, accuracy_score
 
 # ############################### Parameters ###############################
 parser = argparse.ArgumentParser(description='PyTorch CIFAR10/100 Training')
@@ -60,7 +62,8 @@ parser.add_argument('--compressionRate', type=int, default=1, help='Compression 
 # ############################### Misc ###############################
 parser.add_argument('--manualSeed', type=int, default=5094, help='manual seed')
 parser.add_argument('-e', '--evaluate', dest='evaluate', action='store_true', help='evaluate model on validation set')
-parser.add_argument('--save_dir', default='resnet18/', type=str)
+parser.add_argument('-dp', '--data_parallel', action='store_true', help='train mode is data parallel')
+parser.add_argument('--save_dir', default='adversarial_example', type=str)
 
 
 # ############################### Device Option ###############################
@@ -68,7 +71,7 @@ parser.add_argument('--gpu-id', default='0', type=str, help='id(s) for CUDA_VISI
 
 args = parser.parse_args()
 state = {k: v for k, v in args._get_kwargs()}
-os.environ["CUDA_VISIBLE_DEVICES"] = '2,3'
+os.environ["CUDA_VISIBLE_DEVICES"] = '0,1,2,3'
 
 
 use_cuda = torch.cuda.is_available()
@@ -85,7 +88,7 @@ def main():
     global best_acc
     start_epoch = args.start_epoch  # start from epoch 0 or last checkpoint epoch
 
-    os.makedirs(args.save_dir, exist_ok=True)
+#     os.makedirs(args.save_dir, exist_ok=True)
 
     # ############################### Dataset ###############################
     print('==> Preparing dataset %s' % args.dataset)
@@ -98,10 +101,18 @@ def main():
         model = torchvision.models.resnet18()
         num_ftrs = model.fc.in_features
         model.fc = nn.Linear(num_ftrs, label_batch.shape[1])
+    
+    elif args.arch == "mobilenet":
+        model = torchvision.models.mobilenet_v2()
+    elif args.arch == "densenet":
+        model = torchvision.models.densenet121()
+    elif args.arch == "vgg16":
+        model = torchvision.models.vgg16()
     elif args.arch == "resnet50":
         model = torchvision.models.resnet50()
         num_ftrs = model.fc.in_features
         model.fc = nn.Linear(num_ftrs, label_batch.shape[1])
+    
     
     model = torch.nn.DataParallel(model)
     model.cuda()
@@ -126,68 +137,16 @@ def main():
     # evaluate with random initialization parameters
     if args.evaluate:
         print('\nEvaluation only')
-        precision, recall, f1_score = test(dataloaders["val"], model, criterion, -1, use_cuda)
-        print(" Valid : Precision : {} || Recall : {} || F1-Score : {} ".format(precision, recall, f1_score))
-        return
+        precision, recall, f1_score, accuracy = test(dataloaders["test"], model, criterion, -1, use_cuda)
+        print(" Initial : Precision : {:.3f} || Recall : {:.3f} || F1-Score : {:.3f} || Accuracy : {:.3f}".format(precision, recall, f1_score, accuracy))
 
-    # save random initialization parameters
-    save_checkpoint({'state_dict': model.state_dict()}, False, checkpoint=args.save_dir, filename='init.pth.tar')
-    
-    # ############################### Train and val ###############################
-    best_f1 = 0.0
-    fopen = open(args.save_dir + "log_dir.txt", "w")
-    fopen2 = open(args.save_dir + "logger.txt", "w")
-    for epoch in range(start_epoch, args.epochs):
-        adjust_learning_rate(optimizer, epoch)
+    precision, recall, f1_score, accuracy = attack_test(dataloaders["test"], model, criterion, -1, use_cuda)
+    print(" After Attack : Precision : {:.3f} || Recall : {:.3f} || F1-Score : {:.3f} || Accuracy : {:.3f}".format(precision, recall, f1_score, accuracy))
 
-        print('\nEpoch: [%d | %d] LR: %f' % (epoch + 1, args.epochs, state['lr']))
-        score = ""
-        
-        precision, recall, f1_score  = train(dataloaders["train"], model, criterion, optimizer, epoch, use_cuda)
-        print(" Train : Precision : {} || Recall : {} || F1-Score : {} ".format(precision, recall, f1_score))
-        score += str(f1_score) + "\t"
-        
-        precision, recall, f1_score = test(dataloaders["val"], model, criterion, epoch, use_cuda)
-        print(" Valid : Precision : {} || Recall : {} || F1-Score : {} ".format(precision, recall, f1_score))
-        score += str(f1_score) + "\t"
-        
-        if f1_score > best_f1:
-            save_checkpoint({
-                'epoch': epoch + 1,
-                'state_dict': model.state_dict(),
-                'f1_score': f1_score,
-                'prec': precision,
-                'recall': recall,
-                'optimizer' : optimizer.state_dict(),
-            }, True, checkpoint=args.save_dir)
-            best_f1 = f1_score
-            
-        precision, recall, f1_score = test(dataloaders["test"], model, criterion, epoch, use_cuda)
-        print(" Test : Precision : {} || Recall : {} || F1-Score : {} ".format(precision, recall, f1_score))
-        score += str(f1_score) + "\n"
-        fopen2.write(score)
-        fopen2.flush()
-        
-        fopen.write(" Test : Precision : {} || Recall : {} || F1-Score : {} \n".format(precision, recall, f1_score))
-        fopen.flush()
-        
-    # ################################### test ###################################
-    print('Load best model ...')
-    checkpoint = torch.load(os.path.join(args.save_dir, 'model_best.pth.tar'))
-    model.load_state_dict(checkpoint['state_dict'])
-    print("-"*100)
-    precision, recall, f1_score = test(dataloaders["test"], model, criterion, epoch, use_cuda)
-    print(" Valid : Precision : {} || Recall : {} || F1-Score : {} ".format(precision, recall, f1_score))
-    fopen.write("-"*50)
-    fopen.write("\n Valid : Precision : {} || Recall : {} || F1-Score : {} \n".format(precision, recall, f1_score))
+#     print("Precison : {:.3f} \t Recall : {:.3f} \t F1-Score : {:.3f}".format(precision, recall, f1_score))
     
-    
-    fopen.close()
-    fopen2.close()
-    
-def train(trainloader, model, criterion, optimizer, epoch, use_cuda):
-    model.train()
-    
+def attack_test(testloader, model, criterion, epoch, use_cuda):
+
     batch_time = AverageMeter()
     data_time = AverageMeter()
     losses = AverageMeter()
@@ -196,51 +155,46 @@ def train(trainloader, model, criterion, optimizer, epoch, use_cuda):
     pred = torch.FloatTensor().cuda()
     
     end = time.time()
-    bar = Bar('Processing', max=len(trainloader))
-    print(args)
-    for batch_idx, (inputs, targets) in enumerate(trainloader):
+    bar = Bar('Processing', max=len(testloader))
+    for batch_idx, (inputs, targets) in enumerate(testloader):
         data_time.update(time.time() - end)
         targets = torch.max(targets, 1)[1]
-        
+
         if use_cuda:
             inputs, targets = inputs.cuda(), targets.cuda()
-        inputs, targets = torch.autograd.Variable(inputs), torch.autograd.Variable(targets)
+        
+        atk = torchattacks.PGD(model, eps=1/255, alpha=2/255, steps=4)
+        adv_images = atk(inputs, targets)
         
         
-            
-        outputs = model(inputs)
-        loss = criterion(outputs, targets.data)
+        
+        # compute output
+        outputs = model(adv_images)
+        loss = criterion(outputs, targets)
         losses.update(loss.item(), inputs.size(0))
-        
+
         gt = torch.cat((gt, targets.data))
         pred = torch.cat((pred, outputs.data.topk(1)[1].squeeze(1)), 0)
-        
-        # compute gradient and do SGD step
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
 
         # measure elapsed time
         batch_time.update(time.time() - end)
         end = time.time()
-        
+
         # plot progress
-        bar.suffix = '({batch}/{size}) Data: {data:.3f}s | Batch: {bt:.3f}s | Total: {total:} | ETA: {eta:} | Loss: {loss:.4f} '.format(
+        bar.suffix  = '({batch}/{size}) Data: {data:.3f}s | Batch: {bt:.3f}s | Total: {total:} | ETA: {eta:} | Loss: {loss:.4f} '.format(
                     batch=batch_idx + 1,
-                    size=len(trainloader),
+                    size=len(testloader),
                     data=data_time.avg,
                     bt=batch_time.avg,
                     total=bar.elapsed_td,
                     eta=bar.eta_td,
-                    loss=losses.avg,
+                    loss=losses.avg
                     )
         bar.next()
     bar.finish()
-#     print(gt.shape, pred.shape)
-#     print(precision_recall_fscore_support(gt.cpu(), pred.cpu(), average = None)[2])
     scores = precision_recall_fscore_support(gt.cpu(), pred.cpu(), average = "weighted", zero_division = 0)
-    return scores[0], scores[1], scores[2]
-        
+    return scores[0], scores[1], scores[2], accuracy_score(gt.cpu(), pred.cpu())
+
 def test(testloader, model, criterion, epoch, use_cuda):
     model.eval()
 
@@ -286,7 +240,7 @@ def test(testloader, model, criterion, epoch, use_cuda):
             bar.next()
     bar.finish()
     scores = precision_recall_fscore_support(gt.cpu(), pred.cpu(), average = "weighted", zero_division = 0)
-    return scores[0], scores[1], scores[2]
+    return scores[0], scores[1], scores[2], accuracy_score(gt.cpu(), pred.cpu())
         
     
 def adjust_learning_rate(optimizer, epoch):

@@ -1,3 +1,4 @@
+#python weighted_train_distilled.py  --swa
 import argparse
 import os
 import random
@@ -16,7 +17,7 @@ import torchvision.datasets as datasets
 import torch.nn.functional as F
 
 from utils.prepare_data import get_data_models
-from utils.misc import save_checkpoint, AverageMeter
+from utils.misc import save_checkpoint, AverageMeter, moving_average, bn_update
 
 from progress.bar import Bar as Bar
 import matplotlib.pyplot as plt
@@ -61,13 +62,20 @@ parser.add_argument('--compressionRate', type=int, default=1, help='Compression 
 # ############################### Misc ###############################
 parser.add_argument('--manualSeed', type=int, default=5094, help='manual seed')
 parser.add_argument('-e', '--evaluate', dest='evaluate', action='store_true', help='evaluate model on validation set')
-parser.add_argument('--save_dir', default='distillationt2', type=str)
+parser.add_argument('--save_dir', default='weighted_distillationt10_mobilenet', type=str)
+
 # Knowledge distillation parameters
-parser.add_argument('--temperature', default=2, type=float, help='temperature of KD')
+parser.add_argument('--temperature', default=10, type=float, help='temperature of KD')
 parser.add_argument('--alpha', default=0.9, type=float, help='ratio for KL loss')
 
 # ############################### Device Option ###############################
 parser.add_argument('--gpu-id', default='0', type=str, help='id(s) for CUDA_VISIBLE_DEVICES')
+
+########################## SWA setting ##########################
+parser.add_argument('--swa', action='store_true', help='swa usage flag (default: off)')
+parser.add_argument('--swa_start', type=float, default=15, metavar='N', help='SWA start epoch number (default: 55)')
+parser.add_argument('--swa_c_epochs', type=int, default=1, metavar='N', help='SWA model collection frequency/cycle length in epochs (default: 1)')
+
 
 args = parser.parse_args()
 state = {k: v for k, v in args._get_kwargs()}
@@ -99,15 +107,40 @@ def main():
     # ############################### Model ###############################
     if args.arch == "resnet18":
         model = torchvision.models.resnet18()
-        swa_model = 
+        swa_model = torchvision.models.resnet18()
     elif args.arch == "resnet34":
         model = torchvision.models.resnet34()
     elif args.arch == "resnet50":
         model = torchvision.models.resnet50()
+    elif args.arch == "densenet":
+        model = torchvision.models.densenet121()
+        num_fltr = model.classifier.in_features
+        model.classifier = nn.Linear(num_fltr, label_batch.shape[1])
+        model = torch.nn.DataParallel(model)
+    
+        swa_model = torchvision.models.densenet121()
+        num_fltr = swa_model.classifier.in_features
+        swa_model.classifier = nn.Linear(num_fltr, label_batch.shape[1])
+        swa_model = torch.nn.DataParallel(swa_model)
+    elif args.arch == "mobilenet":
+        model = torchvision.models.mobilenet_v2()
+        num_fltr = model.classifier[1].in_features
+        model.classifier[1] = nn.Linear(num_fltr, label_batch.shape[1])
+        model = torch.nn.DataParallel(model)
+    
+        swa_model = torchvision.models.mobilenet_v2()
+        num_fltr = swa_model.classifier[1].in_features
+        swa_model.classifier[1] = nn.Linear(num_fltr, label_batch.shape[1])
+        swa_model = torch.nn.DataParallel(swa_model)
+        
 
-    num_ftrs = model.fc.in_features
-    model.fc = nn.Linear(num_ftrs, label_batch.shape[1])
-    model = torch.nn.DataParallel(model)
+#     num_ftrs = model.fc.in_features
+#     model.fc = nn.Linear(num_ftrs, label_batch.shape[1])
+#     model = torch.nn.DataParallel(model)
+    
+#     num_ftrs = swa_model.fc.in_features
+#     swa_model.fc = nn.Linear(num_ftrs, label_batch.shape[1])
+#     swa_model = torch.nn.DataParallel(swa_model)
     
     model_ref1 = torchvision.models.resnet18()
     num_ftrs = model_ref1.fc.in_features
@@ -130,6 +163,7 @@ def main():
     model_ref4 = torch.nn.DataParallel(model_ref4)
     
     model.cuda()
+    swa_model.cuda()
     model_ref1.cuda()
     model_ref2.cuda()
     model_ref3.cuda()
@@ -186,9 +220,9 @@ def main():
     
     # ############################### Train and val ###############################
     best_f1 = 0.0
-    fopen = open(args.save_dir + "log_dir.txt", "w")
-    fopen2 = open(args.save_dir + "logger.txt", "w")
-    
+    fopen = open(args.save_dir + "/log_dir.txt", "w")
+    fopen2 = open(args.save_dir + "/logger.txt", "w")
+    swa_n = 0  
     
     for epoch in range(start_epoch, args.epochs):
         adjust_learning_rate(optimizer, epoch)
@@ -200,22 +234,18 @@ def main():
         print(" Train : Precision : {:.3f} || Recall : {:.3f} || F1-Score : {:.3f} || Micro F1-Score : {:.3f} || Macro F1-Score : {:.3f} || Accuracy : {:.3f}".format(precision, recall, f1_score, micro_f1, macro_f1, accuracy))
         score += str(f1_score) + "\t"
         
-        precision, recall, f1_score, micro_f1, macro_f1, accuracy = test(dataloaders["val"], model, criterion, epoch, use_cuda)
+        if args.swa and epoch >= args.swa_start and (epoch - args.swa_start) % args.swa_c_epochs == 0:
+            print("SWA Started")
+            # SWA
+            moving_average(swa_model, model, 1.0 / (swa_n + 1))
+            swa_n += 1
+            bn_update(dataloaders["train"], swa_model)
+        
+        precision, recall, f1_score, micro_f1, macro_f1, accuracy = test(dataloaders["val"], swa_model, criterion, epoch, use_cuda)
         print(" Valid : Precision : {:.3f} || Recall : {:.3f} || F1-Score : {:.3f} || Micro F1-Score : {:.3f} || Macro F1-Score : {:.3f} || Accuracy : {:.3f}".format(precision, recall, f1_score, micro_f1, macro_f1, accuracy))
         score += str(f1_score) + "\t ||"
         
-        if f1_score > best_f1:
-            save_checkpoint({
-                'epoch': epoch + 1,
-                'state_dict': model.state_dict(),
-                'f1_score': f1_score,
-                'prec': precision,
-                'recall': recall,
-                'optimizer' : optimizer.state_dict(),
-            }, True, checkpoint=args.save_dir)
-            best_f1 = f1_score
-            
-        precision, recall, f1_score, micro_f1, macro_f1, accuracy = test(dataloaders["test"], model, criterion, epoch, use_cuda)
+        precision, recall, f1_score, micro_f1, macro_f1, accuracy = test(dataloaders["test"], swa_model, criterion, epoch, use_cuda)
         print(" Test : Precision : {:.3f} || Recall : {:.3f} || F1-Score : {:.3f} || Micro F1-Score : {:.3f} || Macro F1-Score : {:.3f} || Accuracy : {:.3f}".format(precision, recall, f1_score, micro_f1, macro_f1, accuracy))
         score += str(f1_score) + " - " + str(micro_f1) + " - " + str(macro_f1) + " - " + str(accuracy) + "\n"
         fopen2.write(score)
@@ -223,13 +253,26 @@ def main():
         
         fopen.write(" Test : Precision : {:.3f} || Recall : {:.3f} || F1-Score : {:.3f} || Micro F1-Score : {:.3f} || Macro F1-Score : {:.3f} || Accuracy : {:.3f}\n".format(precision, recall, f1_score, micro_f1, macro_f1, accuracy))
         fopen.flush()
+        
+        if f1_score > best_f1:
+            save_checkpoint({
+                'epoch': epoch + 1,
+                'state_dict': swa_model.state_dict(),
+                'f1_score': f1_score,
+                'prec': precision,
+                'recall': recall,
+                'optimizer' : optimizer.state_dict(),
+            }, True, checkpoint=args.save_dir)
+            best_f1 = f1_score
+            
+        
     
     # ################################### test ###################################
     print('Load best model ...')
     checkpoint = torch.load(os.path.join(args.save_dir, 'model_best.pth.tar'))
     model.load_state_dict(checkpoint['state_dict'])
     print("-"*100)
-    precision, recall, f1_score, micro_f1, macro_f1, accuracy = test(dataloaders["test"], model, criterion, epoch, use_cuda)
+    precision, recall, f1_score, micro_f1, macro_f1, accuracy = test(dataloaders["test"], swa_model, criterion, epoch, use_cuda)
     print("\n Test : Precision : {:.3f} || Recall : {:.3f} || F1-Score : {:.3f} || Micro F1-Score : {:.3f} || Macro F1-Score : {:.3f} || Accuracy : {:.3f}".format(precision, recall, f1_score, micro_f1, macro_f1, accuracy))
     
     fopen.write("-"*50)
@@ -353,6 +396,21 @@ def test(testloader, model, criterion, epoch, use_cuda):
     micro_scores = precision_recall_fscore_support(gt.cpu(), pred.cpu(), average = "micro", zero_division = 0)
     macro_scores = precision_recall_fscore_support(gt.cpu(), pred.cpu(), average = "macro", zero_division = 0)
     return scores[0], scores[1], scores[2], micro_scores[2], macro_scores[2], accuracy_score(gt.cpu(), pred.cpu())
+
+def loss_label_smoothing(outputs, labels):
+    """
+    loss function for label smoothing regularization
+    """
+    alpha = 0.1
+    N = outputs.size(0)  # batch_size
+    C = outputs.size(1)  # number of classes
+    smoothed_labels = torch.full(size=(N, C), fill_value= alpha / (C - 1)).cuda()
+    smoothed_labels.scatter_(dim=1, index=torch.unsqueeze(labels, dim=1), value=1-alpha)
+
+    log_prob = torch.nn.functional.log_softmax(outputs, dim=1)
+    loss = -torch.sum(log_prob * smoothed_labels) / N
+
+    return loss
 
 def loss_fn_kd(outputs, labels, ref_logit1, ref_logit2, ref_logit3, ref_logit4):
     """

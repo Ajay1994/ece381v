@@ -60,7 +60,7 @@ parser.add_argument('--compressionRate', type=int, default=1, help='Compression 
 # ############################### Misc ###############################
 parser.add_argument('--manualSeed', type=int, default=5094, help='manual seed')
 parser.add_argument('-e', '--evaluate', dest='evaluate', action='store_true', help='evaluate model on validation set')
-parser.add_argument('--save_dir', default='resnet18/', type=str)
+parser.add_argument('--save_dir', default='mobilenet/', type=str)
 
 
 # ############################### Device Option ###############################
@@ -68,7 +68,7 @@ parser.add_argument('--gpu-id', default='0', type=str, help='id(s) for CUDA_VISI
 
 args = parser.parse_args()
 state = {k: v for k, v in args._get_kwargs()}
-os.environ["CUDA_VISIBLE_DEVICES"] = '2,3'
+os.environ["CUDA_VISIBLE_DEVICES"] = '0,1'
 
 
 use_cuda = torch.cuda.is_available()
@@ -94,15 +94,12 @@ def main():
     print("Data Loaded: {} | {}".format(img_batch.shape, label_batch.shape))
     
     # ############################### Model ###############################
-    if args.arch == "resnet18":
-        model = torchvision.models.resnet18()
-        num_ftrs = model.fc.in_features
-        model.fc = nn.Linear(num_ftrs, label_batch.shape[1])
-    elif args.arch == "resnet50":
-        model = torchvision.models.resnet50()
-        num_ftrs = model.fc.in_features
-        model.fc = nn.Linear(num_ftrs, label_batch.shape[1])
+
+    model = torchvision.models.mobilenet_v2()
+    num_fltr = model.classifier[1].in_features
+    model.classifier[1] = nn.Linear(num_fltr, label_batch.shape[1])
     
+    print(model)
     model = torch.nn.DataParallel(model)
     model.cuda()
    

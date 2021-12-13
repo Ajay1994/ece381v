@@ -1,4 +1,3 @@
-#python train_base.py --arch resnet18 --save_dir resnet18/
 import argparse
 import os
 import random
@@ -20,7 +19,7 @@ from utils.misc import save_checkpoint, AverageMeter
 
 from progress.bar import Bar as Bar
 import matplotlib.pyplot as plt
-
+from sklearn.metrics import classification_report
 from sklearn.metrics import precision_recall_fscore_support
 
 # ############################### Parameters ###############################
@@ -44,7 +43,7 @@ parser.add_argument('--weight-decay', '--wd', default=2e-4, type=float, metavar=
 
 
 # ############################### Checkpoints ###############################
-parser.add_argument('--resume', default='', type=str, metavar='PATH', help='path to latest checkpoint (default: none)')
+parser.add_argument('--resume', default='./resnet18/model_best.pth.tar', type=str, metavar='PATH', help='path to latest checkpoint (default: none)')
 
 
 # ############################### Architecture ###############################
@@ -85,8 +84,6 @@ def main():
     global best_acc
     start_epoch = args.start_epoch  # start from epoch 0 or last checkpoint epoch
 
-    os.makedirs(args.save_dir, exist_ok=True)
-
     # ############################### Dataset ###############################
     print('==> Preparing dataset %s' % args.dataset)
     dataloaders = get_data_models(args)
@@ -113,133 +110,17 @@ def main():
     
     # ############################### Resume ###############################
     title = args.dataset + "-" + args.arch
-    if args.resume:
-        print('==> Resuming from checkpoint..')
-        assert os.path.isfile(args.resume), 'Error: no checkpoint directory found!'
-        checkpoint = torch.load(args.resume)
-        best_f1 = checkpoint['f1_score']
-        start_epoch = checkpoint['epoch']
-        model.load_state_dict(checkpoint['state_dict'])
-        optimizer.load_state_dict(checkpoint['optimizer'])
-        print("Best F1-Score : {}".format(best_f1)) # Valid : Precision : 0.7257768869054372 || Recall : 0.7616580310880829 || F1-Score : 0.7397434352609674
-        
-    # evaluate with random initialization parameters
-    if args.evaluate:
-        print('\nEvaluation only')
-        precision, recall, f1_score = test(dataloaders["val"], model, criterion, -1, use_cuda)
-        print(" Valid : Precision : {} || Recall : {} || F1-Score : {} ".format(precision, recall, f1_score))
-        return
-
-    # save random initialization parameters
-    save_checkpoint({'state_dict': model.state_dict()}, False, checkpoint=args.save_dir, filename='init.pth.tar')
-    
-    # ############################### Train and val ###############################
-    best_f1 = 0.0
-    fopen = open(args.save_dir + "log_dir.txt", "w")
-    fopen2 = open(args.save_dir + "logger.txt", "w")
-    for epoch in range(start_epoch, args.epochs):
-        adjust_learning_rate(optimizer, epoch)
-
-        print('\nEpoch: [%d | %d] LR: %f' % (epoch + 1, args.epochs, state['lr']))
-        score = ""
-        
-        precision, recall, f1_score  = train(dataloaders["train"], model, criterion, optimizer, epoch, use_cuda)
-        print(" Train : Precision : {} || Recall : {} || F1-Score : {} ".format(precision, recall, f1_score))
-        score += str(f1_score) + "\t"
-        
-        precision, recall, f1_score = test(dataloaders["val"], model, criterion, epoch, use_cuda)
-        print(" Valid : Precision : {} || Recall : {} || F1-Score : {} ".format(precision, recall, f1_score))
-        score += str(f1_score) + "\t"
-        
-        if f1_score > best_f1:
-            save_checkpoint({
-                'epoch': epoch + 1,
-                'state_dict': model.state_dict(),
-                'f1_score': f1_score,
-                'prec': precision,
-                'recall': recall,
-                'optimizer' : optimizer.state_dict(),
-            }, True, checkpoint=args.save_dir)
-            best_f1 = f1_score
-            
-        precision, recall, f1_score = test(dataloaders["test"], model, criterion, epoch, use_cuda)
-        print(" Test : Precision : {} || Recall : {} || F1-Score : {} ".format(precision, recall, f1_score))
-        score += str(f1_score) + "\n"
-        fopen2.write(score)
-        fopen2.flush()
-        
-        fopen.write(" Test : Precision : {} || Recall : {} || F1-Score : {} \n".format(precision, recall, f1_score))
-        fopen.flush()
-        
-    # ################################### test ###################################
-    print('Load best model ...')
-    checkpoint = torch.load(os.path.join(args.save_dir, 'model_best.pth.tar'))
+    print('==> Resuming from checkpoint..')
+    assert os.path.isfile(args.resume), 'Error: no checkpoint directory found!'
+    checkpoint = torch.load(args.resume)
+    best_f1 = checkpoint['f1_score']
+    start_epoch = checkpoint['epoch']
     model.load_state_dict(checkpoint['state_dict'])
-    print("-"*100)
-    precision, recall, f1_score = test(dataloaders["test"], model, criterion, epoch, use_cuda)
+    optimizer.load_state_dict(checkpoint['optimizer'])
+#     print("Best F1-Score : {}".format(best_f1)) # Valid : Precision : 0.7257768869054372 || Recall : 0.7616580310880829 || F1-Score : 0.7397434352609674
+    precision, recall, f1_score = test(dataloaders["test"], model, criterion, -1, use_cuda)
     print(" Valid : Precision : {} || Recall : {} || F1-Score : {} ".format(precision, recall, f1_score))
-    fopen.write("-"*50)
-    fopen.write("\n Valid : Precision : {} || Recall : {} || F1-Score : {} \n".format(precision, recall, f1_score))
     
-    
-    fopen.close()
-    fopen2.close()
-    
-def train(trainloader, model, criterion, optimizer, epoch, use_cuda):
-    model.train()
-    
-    batch_time = AverageMeter()
-    data_time = AverageMeter()
-    losses = AverageMeter()
-    
-    gt = torch.FloatTensor().cuda()
-    pred = torch.FloatTensor().cuda()
-    
-    end = time.time()
-    bar = Bar('Processing', max=len(trainloader))
-    print(args)
-    for batch_idx, (inputs, targets) in enumerate(trainloader):
-        data_time.update(time.time() - end)
-        targets = torch.max(targets, 1)[1]
-        
-        if use_cuda:
-            inputs, targets = inputs.cuda(), targets.cuda()
-        inputs, targets = torch.autograd.Variable(inputs), torch.autograd.Variable(targets)
-        
-        
-            
-        outputs = model(inputs)
-        loss = criterion(outputs, targets.data)
-        losses.update(loss.item(), inputs.size(0))
-        
-        gt = torch.cat((gt, targets.data))
-        pred = torch.cat((pred, outputs.data.topk(1)[1].squeeze(1)), 0)
-        
-        # compute gradient and do SGD step
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
-
-        # measure elapsed time
-        batch_time.update(time.time() - end)
-        end = time.time()
-        
-        # plot progress
-        bar.suffix = '({batch}/{size}) Data: {data:.3f}s | Batch: {bt:.3f}s | Total: {total:} | ETA: {eta:} | Loss: {loss:.4f} '.format(
-                    batch=batch_idx + 1,
-                    size=len(trainloader),
-                    data=data_time.avg,
-                    bt=batch_time.avg,
-                    total=bar.elapsed_td,
-                    eta=bar.eta_td,
-                    loss=losses.avg,
-                    )
-        bar.next()
-    bar.finish()
-#     print(gt.shape, pred.shape)
-#     print(precision_recall_fscore_support(gt.cpu(), pred.cpu(), average = None)[2])
-    scores = precision_recall_fscore_support(gt.cpu(), pred.cpu(), average = "weighted", zero_division = 0)
-    return scores[0], scores[1], scores[2]
         
 def test(testloader, model, criterion, epoch, use_cuda):
     model.eval()
@@ -286,6 +167,8 @@ def test(testloader, model, criterion, epoch, use_cuda):
             bar.next()
     bar.finish()
     scores = precision_recall_fscore_support(gt.cpu(), pred.cpu(), average = "weighted", zero_division = 0)
+    
+    print(classification_report(gt.cpu(), pred.cpu(), target_names=["MEL","NV","BCC","AK","BKL","DF","VASC","SCC"]))
     return scores[0], scores[1], scores[2]
         
     

@@ -1,9 +1,11 @@
+#python weighted_train_distilled.py  --swa
 import argparse
 import os
 import random
 import shutil
 import time
 import sys
+import numpy as np
 
 import torch
 import torch.nn as nn
@@ -14,9 +16,10 @@ import torch.utils.data as data
 import torchvision.transforms as transforms
 import torchvision.datasets as datasets
 import torch.nn.functional as F
+from sklearn.metrics import roc_auc_score
 
 from utils.prepare_data import get_data_models
-from utils.misc import save_checkpoint, AverageMeter
+from utils.misc import save_checkpoint, AverageMeter, moving_average, bn_update
 
 from progress.bar import Bar as Bar
 import matplotlib.pyplot as plt
@@ -31,13 +34,13 @@ parser.add_argument('-d', '--dataset', default='Lesion', type=str)
 parser.add_argument('-j', '--workers', default=4, type=int, metavar='N', help='number of data loading workers (default: 4)')
 
 # ############################### Optimization Option ###############################
-parser.add_argument('--epochs', default=100, type=int, metavar='N', help='number of total epochs to run')
+parser.add_argument('--epochs', default=20, type=int, metavar='N', help='number of total epochs to run')
 parser.add_argument('--start_epoch', default=0, type=int, metavar='N', help='manual epoch number (useful on restarts)')
 parser.add_argument('--train_batch', default=128, type=int, metavar='N', help='train batchsize')
 parser.add_argument('--test_batch', default=64, type=int, metavar='N', help='test batchsize')
 parser.add_argument('--lr', '--learning-rate', default=0.1, type=float, metavar='LR', help='initial learning rate')
 parser.add_argument('--drop', '--dropout', default=0, type=float, metavar='Dropout', help='Dropout ratio')
-parser.add_argument('--schedule', type=int, nargs='+', default=[20, 35, 55, 70], help='Decrease learning rate at these epochs.')
+parser.add_argument('--schedule', type=int, nargs='+', default=[10, 15, 25], help='Decrease learning rate at these epochs.')
 parser.add_argument('--gamma', type=float, default=0.1, help='LR is multiplied by gamma on schedule.')
 parser.add_argument('--momentum', default=0.9, type=float, metavar='M', help='momentum')
 parser.add_argument('--weight-decay', '--wd', default=2e-4, type=float, metavar='W', help='weight decay (default: 1e-4)')
@@ -45,7 +48,7 @@ parser.add_argument('--weight-decay', '--wd', default=2e-4, type=float, metavar=
 
 # ############################### Checkpoints ###############################
 parser.add_argument('--resume', default='', type=str, metavar='PATH', help='path to latest checkpoint (default: none)')
-parser.add_argument('--distill', default=['resnet18/model_best.pth.tar', 'resnet50/model_best.pth.tar', 'mobilenet/model_best.pth.tar', 'densenet/model_best.pth.tar'], type=str, metavar='PATH', help='path to latest checkpoint (default: none)')
+parser.add_argument('--distill', default=['chest_resnet18/model_best.pth.tar', 'chest_resnet50/model_best.pth.tar', 'chest_mobilenet/model_best.pth.tar', 'chest_densenet/model_best.pth.tar'], type=str, metavar='PATH', help='path to latest checkpoint (default: none)')
 
 
 # ############################### Architecture ###############################
@@ -61,17 +64,24 @@ parser.add_argument('--compressionRate', type=int, default=1, help='Compression 
 # ############################### Misc ###############################
 parser.add_argument('--manualSeed', type=int, default=5094, help='manual seed')
 parser.add_argument('-e', '--evaluate', dest='evaluate', action='store_true', help='evaluate model on validation set')
-parser.add_argument('--save_dir', default='distillationt2', type=str)
+parser.add_argument('--save_dir', default='weighted_distillationt10_mobilenet', type=str)
+
 # Knowledge distillation parameters
-parser.add_argument('--temperature', default=2, type=float, help='temperature of KD')
+parser.add_argument('--temperature', default=10, type=float, help='temperature of KD')
 parser.add_argument('--alpha', default=0.9, type=float, help='ratio for KL loss')
 
 # ############################### Device Option ###############################
 parser.add_argument('--gpu-id', default='0', type=str, help='id(s) for CUDA_VISIBLE_DEVICES')
 
+########################## SWA setting ##########################
+parser.add_argument('--swa', action='store_true', help='swa usage flag (default: off)')
+parser.add_argument('--swa_start', type=float, default=5, metavar='N', help='SWA start epoch number (default: 55)')
+parser.add_argument('--swa_c_epochs', type=int, default=1, metavar='N', help='SWA model collection frequency/cycle length in epochs (default: 1)')
+
+
 args = parser.parse_args()
 state = {k: v for k, v in args._get_kwargs()}
-os.environ["CUDA_VISIBLE_DEVICES"] = '0,1,2,3'
+os.environ["CUDA_VISIBLE_DEVICES"] = '2,3'
 
 
 use_cuda = torch.cuda.is_available()
@@ -93,22 +103,51 @@ def main():
     # ############################### Dataset ###############################
     print('==> Preparing dataset %s' % args.dataset)
     dataloaders = get_data_models(args)
-    img_batch, label_batch = next(iter(dataloaders["train"]))
+    index, img_batch, label_batch = next(iter(dataloaders["train"]))
     print("Data Loaded: {} | {}".format(img_batch.shape, label_batch.shape))
     
     # ############################### Model ###############################
     if args.arch == "resnet18":
-        model = torchvision.models.resnet18()
-        swa_model = 
+        model = torchvision.models.resnet18(pretrained=True)
+        swa_model = torchvision.models.resnet18(pretrained=True)
+        
+        model = torch.nn.DataParallel(model)
+        swa_model = torch.nn.DataParallel(swa_model)
     elif args.arch == "resnet34":
-        model = torchvision.models.resnet34()
+        model = torchvision.models.resnet34(pretrained=True)
     elif args.arch == "resnet50":
-        model = torchvision.models.resnet50()
-
-    num_ftrs = model.fc.in_features
-    model.fc = nn.Linear(num_ftrs, label_batch.shape[1])
-    model = torch.nn.DataParallel(model)
+        model = torchvision.models.resnet50(pretrained=True)
+        swa_model = torchvision.models.resnet50(pretrained=True)
+    elif args.arch == "densenet":
+        model = torchvision.models.densenet121(pretrained=True)
+        num_fltr = model.classifier.in_features
+        model.classifier = nn.Linear(num_fltr, label_batch.shape[1])
+        model = torch.nn.DataParallel(model)
     
+        swa_model = torchvision.models.densenet121(pretrained=True)
+        num_fltr = swa_model.classifier.in_features
+        swa_model.classifier = nn.Linear(num_fltr, label_batch.shape[1])
+        swa_model = torch.nn.DataParallel(swa_model)
+    elif args.arch == "mobilenet":
+        model = torchvision.models.mobilenet_v2(pretrained=True)
+        num_fltr = model.classifier[1].in_features
+        model.classifier[1] = nn.Linear(num_fltr, label_batch.shape[1])
+        model = torch.nn.DataParallel(model)
+    
+        swa_model = torchvision.models.mobilenet_v2(pretrained=True)
+        num_fltr = swa_model.classifier[1].in_features
+        swa_model.classifier[1] = nn.Linear(num_fltr, label_batch.shape[1])
+        swa_model = torch.nn.DataParallel(swa_model)
+        
+
+#     num_ftrs = model.fc.in_features
+#     model.fc = nn.Linear(num_ftrs, label_batch.shape[1])
+#     model = torch.nn.DataParallel(model)
+    
+#     num_ftrs = swa_model.fc.in_features
+#     swa_model.fc = nn.Linear(num_ftrs, label_batch.shape[1])
+#     swa_model = torch.nn.DataParallel(swa_model)
+    print(model, swa_model)
     model_ref1 = torchvision.models.resnet18()
     num_ftrs = model_ref1.fc.in_features
     model_ref1.fc = nn.Linear(num_ftrs, label_batch.shape[1])
@@ -130,6 +169,7 @@ def main():
     model_ref4 = torch.nn.DataParallel(model_ref4)
     
     model.cuda()
+    swa_model.cuda()
     model_ref1.cuda()
     model_ref2.cuda()
     model_ref3.cuda()
@@ -185,10 +225,10 @@ def main():
     save_checkpoint({'state_dict': model.state_dict()}, False, checkpoint=args.save_dir, filename='init.pth.tar')
     
     # ############################### Train and val ###############################
-    best_f1 = 0.0
-    fopen = open(args.save_dir + "log_dir.txt", "w")
-    fopen2 = open(args.save_dir + "logger.txt", "w")
-    
+    best_auc = 0.0
+    fopen = open(args.save_dir + "/log_dir.txt", "w")
+    fopen2 = open(args.save_dir + "/logger.txt", "w")
+    swa_n = 0  
     
     for epoch in range(start_epoch, args.epochs):
         adjust_learning_rate(optimizer, epoch)
@@ -196,45 +236,53 @@ def main():
         print('\nEpoch: [%d | %d] LR: %f' % (epoch + 1, args.epochs, state['lr']))
         score = ""
         
-        precision, recall, f1_score, micro_f1, macro_f1, accuracy  = train(dataloaders["train"], model, model_ref1, model_ref2, model_ref3, model_ref4, criterion, optimizer, epoch, use_cuda)
-        print(" Train : Precision : {:.3f} || Recall : {:.3f} || F1-Score : {:.3f} || Micro F1-Score : {:.3f} || Macro F1-Score : {:.3f} || Accuracy : {:.3f}".format(precision, recall, f1_score, micro_f1, macro_f1, accuracy))
-        score += str(f1_score) + "\t"
+        mean_AUC, AUCs  = train(dataloaders["train"], model, model_ref1, model_ref2, model_ref3, model_ref4, criterion, optimizer, epoch, use_cuda)
+        print(" Train :  Mean AUC : {} || AUCs : {} ".format(mean_AUC, AUCs))
+        score += str(mean_AUC) + "\t"
         
-        precision, recall, f1_score, micro_f1, macro_f1, accuracy = test(dataloaders["val"], model, criterion, epoch, use_cuda)
-        print(" Valid : Precision : {:.3f} || Recall : {:.3f} || F1-Score : {:.3f} || Micro F1-Score : {:.3f} || Macro F1-Score : {:.3f} || Accuracy : {:.3f}".format(precision, recall, f1_score, micro_f1, macro_f1, accuracy))
-        score += str(f1_score) + "\t ||"
+        if args.swa and epoch >= args.swa_start and (epoch - args.swa_start) % args.swa_c_epochs == 0:
+            print("SWA Started")
+            # SWA
+            moving_average(swa_model, model, 1.0 / (swa_n + 1))
+            swa_n += 1
+            bn_update(dataloaders["train"], swa_model)
         
-        if f1_score > best_f1:
+        mean_AUC, AUCs = test(dataloaders["val"], swa_model, criterion, epoch, use_cuda)
+        print(" Valid :  Mean AUC : {} || AUCs : {} ".format(mean_AUC, AUCs))
+        score += str(mean_AUC) + "\t"
+        
+        mean_AUC, AUCs = test(dataloaders["test"], swa_model, criterion, epoch, use_cuda)
+        print(" Test :  Mean AUC : {} || AUCs : {} ".format(mean_AUC, AUCs))
+        score += str(mean_AUC) + "\n"
+        
+        if mean_AUC > best_auc:
             save_checkpoint({
                 'epoch': epoch + 1,
                 'state_dict': model.state_dict(),
-                'f1_score': f1_score,
-                'prec': precision,
-                'recall': recall,
+                'auc_score': mean_AUC,
                 'optimizer' : optimizer.state_dict(),
             }, True, checkpoint=args.save_dir)
-            best_f1 = f1_score
+            best_auc = mean_AUC
             
-        precision, recall, f1_score, micro_f1, macro_f1, accuracy = test(dataloaders["test"], model, criterion, epoch, use_cuda)
-        print(" Test : Precision : {:.3f} || Recall : {:.3f} || F1-Score : {:.3f} || Micro F1-Score : {:.3f} || Macro F1-Score : {:.3f} || Accuracy : {:.3f}".format(precision, recall, f1_score, micro_f1, macro_f1, accuracy))
-        score += str(f1_score) + " - " + str(micro_f1) + " - " + str(macro_f1) + " - " + str(accuracy) + "\n"
+        
         fopen2.write(score)
         fopen2.flush()
         
-        fopen.write(" Test : Precision : {:.3f} || Recall : {:.3f} || F1-Score : {:.3f} || Micro F1-Score : {:.3f} || Macro F1-Score : {:.3f} || Accuracy : {:.3f}\n".format(precision, recall, f1_score, micro_f1, macro_f1, accuracy))
+        fopen.write(" Test : Mean AUC : {:.3f} || AUCs : {} \n".format(mean_AUC, AUCs))
         fopen.flush()
-    
     # ################################### test ###################################
     print('Load best model ...')
     checkpoint = torch.load(os.path.join(args.save_dir, 'model_best.pth.tar'))
     model.load_state_dict(checkpoint['state_dict'])
     print("-"*100)
-    precision, recall, f1_score, micro_f1, macro_f1, accuracy = test(dataloaders["test"], model, criterion, epoch, use_cuda)
-    print("\n Test : Precision : {:.3f} || Recall : {:.3f} || F1-Score : {:.3f} || Micro F1-Score : {:.3f} || Macro F1-Score : {:.3f} || Accuracy : {:.3f}".format(precision, recall, f1_score, micro_f1, macro_f1, accuracy))
-    
+    mean_AUC, AUCs = test(dataloaders["test"], model, criterion, epoch, use_cuda)
+    print(" Test :  Mean AUC : {} || AUCs : {} ".format(mean_AUC, AUCs))
     fopen.write("-"*50)
-    fopen.write("\n Test : Precision : {:.3f} || Recall : {:.3f} || F1-Score : {:.3f} || Micro F1-Score : {:.3f} || Macro F1-Score : {:.3f} || Accuracy : {:.3f}".format(precision, recall, f1_score, micro_f1, macro_f1, accuracy))
+    fopen.write("Best Test :  Mean AUC : {} || AUCs : {} ".format(mean_AUC, AUCs))
+    
+    
     fopen.close()
+    fopen2.close()
     
 def train(trainloader, model, model_ref1,  model_ref2, model_ref3, model_ref4,  criterion, optimizer, epoch, use_cuda):
     model.train()
@@ -253,9 +301,8 @@ def train(trainloader, model, model_ref1,  model_ref2, model_ref3, model_ref4,  
     end = time.time()
     bar = Bar('Processing', max=len(trainloader))
     print(args)
-    for batch_idx, (inputs, targets) in enumerate(trainloader):
+    for batch_idx, (index, inputs, targets) in enumerate(trainloader):
         data_time.update(time.time() - end)
-        targets = torch.max(targets, 1)[1]
         
         if use_cuda:
             inputs, targets = inputs.cuda(), targets.cuda()
@@ -275,7 +322,7 @@ def train(trainloader, model, model_ref1,  model_ref2, model_ref3, model_ref4,  
         losses.update(loss.item(), inputs.size(0))
         
         gt = torch.cat((gt, targets.data))
-        pred = torch.cat((pred, outputs.data.topk(1)[1].squeeze(1)), 0)
+        pred = torch.cat((pred, outputs.data), 0)
         
         # compute gradient and do SGD step
         optimizer.zero_grad()
@@ -300,10 +347,8 @@ def train(trainloader, model, model_ref1,  model_ref2, model_ref3, model_ref4,  
     bar.finish()
 #     print(gt.shape, pred.shape)
 #     print(precision_recall_fscore_support(gt.cpu(), pred.cpu(), average = None)[2])
-    scores = precision_recall_fscore_support(gt.cpu(), pred.cpu(), average = "weighted", zero_division = 0)
-    micro_scores = precision_recall_fscore_support(gt.cpu(), pred.cpu(), average = "micro", zero_division = 0)
-    macro_scores = precision_recall_fscore_support(gt.cpu(), pred.cpu(), average = "macro", zero_division = 0)
-    return scores[0], scores[1], scores[2], micro_scores[2], macro_scores[2], accuracy_score(gt.cpu(), pred.cpu())
+    mean_auc, AUCs = compute_AUCs(gt, pred)
+    return mean_auc, AUCs
         
 def test(testloader, model, criterion, epoch, use_cuda):
     model.eval()
@@ -318,9 +363,8 @@ def test(testloader, model, criterion, epoch, use_cuda):
     end = time.time()
     bar = Bar('Processing', max=len(testloader))
     with torch.no_grad():
-        for batch_idx, (inputs, targets) in enumerate(testloader):
+        for batch_idx, (index, inputs, targets) in enumerate(testloader):
             data_time.update(time.time() - end)
-            targets = torch.max(targets, 1)[1]
 
             if use_cuda:
                 inputs, targets = inputs.cuda(), targets.cuda()
@@ -331,7 +375,7 @@ def test(testloader, model, criterion, epoch, use_cuda):
             losses.update(loss.item(), inputs.size(0))
             
             gt = torch.cat((gt, targets.data))
-            pred = torch.cat((pred, outputs.data.topk(1)[1].squeeze(1)), 0)
+            pred = torch.cat((pred, outputs.data), 0)
 
             # measure elapsed time
             batch_time.update(time.time() - end)
@@ -349,10 +393,23 @@ def test(testloader, model, criterion, epoch, use_cuda):
                         )
             bar.next()
     bar.finish()
-    scores = precision_recall_fscore_support(gt.cpu(), pred.cpu(), average = "weighted", zero_division = 0)
-    micro_scores = precision_recall_fscore_support(gt.cpu(), pred.cpu(), average = "micro", zero_division = 0)
-    macro_scores = precision_recall_fscore_support(gt.cpu(), pred.cpu(), average = "macro", zero_division = 0)
-    return scores[0], scores[1], scores[2], micro_scores[2], macro_scores[2], accuracy_score(gt.cpu(), pred.cpu())
+    mean_auc, AUCs = compute_AUCs(gt, pred)
+    return mean_auc, AUCs
+
+def loss_label_smoothing(outputs, labels):
+    """
+    loss function for label smoothing regularization
+    """
+    alpha = 0.1
+    N = outputs.size(0)  # batch_size
+    C = outputs.size(1)  # number of classes
+    smoothed_labels = torch.full(size=(N, C), fill_value= alpha / (C - 1)).cuda()
+    smoothed_labels.scatter_(dim=1, index=torch.unsqueeze(labels, dim=1), value=1-alpha)
+
+    log_prob = torch.nn.functional.log_softmax(outputs, dim=1)
+    loss = -torch.sum(log_prob * smoothed_labels) / N
+
+    return loss
 
 def loss_fn_kd(outputs, labels, ref_logit1, ref_logit2, ref_logit3, ref_logit4):
     """
@@ -391,7 +448,14 @@ def adjust_learning_rate(optimizer, epoch):
         state['lr'] *= args.gamma
         for param_group in optimizer.param_groups:
             param_group['lr'] = state['lr']
-            
+def compute_AUCs(gt, pred):
+    AUROCs = []
+    gt_np = gt.cpu().numpy()
+    pred_np = pred.cpu().numpy()
+    for i in range(14):
+        AUROCs.append(roc_auc_score(gt_np[:, i], pred_np[:, i]))
+    return np.array(AUROCs).mean(), AUROCs
+
 if __name__ == '__main__':
     main()
 

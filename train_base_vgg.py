@@ -33,8 +33,8 @@ parser.add_argument('-j', '--workers', default=4, type=int, metavar='N', help='n
 # ############################### Optimization Option ###############################
 parser.add_argument('--epochs', default=100, type=int, metavar='N', help='number of total epochs to run')
 parser.add_argument('--start_epoch', default=0, type=int, metavar='N', help='manual epoch number (useful on restarts)')
-parser.add_argument('--train_batch', default=128, type=int, metavar='N', help='train batchsize')
-parser.add_argument('--test_batch', default=128, type=int, metavar='N', help='test batchsize')
+parser.add_argument('--train_batch', default=64, type=int, metavar='N', help='train batchsize')
+parser.add_argument('--test_batch', default=64, type=int, metavar='N', help='test batchsize')
 parser.add_argument('--lr', '--learning-rate', default=0.1, type=float, metavar='LR', help='initial learning rate')
 parser.add_argument('--drop', '--dropout', default=0, type=float, metavar='Dropout', help='Dropout ratio')
 parser.add_argument('--schedule', type=int, nargs='+', default=[35, 65, 80], help='Decrease learning rate at these epochs.')
@@ -60,7 +60,7 @@ parser.add_argument('--compressionRate', type=int, default=1, help='Compression 
 # ############################### Misc ###############################
 parser.add_argument('--manualSeed', type=int, default=5094, help='manual seed')
 parser.add_argument('-e', '--evaluate', dest='evaluate', action='store_true', help='evaluate model on validation set')
-parser.add_argument('--save_dir', default='resnet18/', type=str)
+parser.add_argument('--save_dir', default='densenet/', type=str)
 
 
 # ############################### Device Option ###############################
@@ -94,15 +94,13 @@ def main():
     print("Data Loaded: {} | {}".format(img_batch.shape, label_batch.shape))
     
     # ############################### Model ###############################
-    if args.arch == "resnet18":
-        model = torchvision.models.resnet18()
-        num_ftrs = model.fc.in_features
-        model.fc = nn.Linear(num_ftrs, label_batch.shape[1])
-    elif args.arch == "resnet50":
-        model = torchvision.models.resnet50()
-        num_ftrs = model.fc.in_features
-        model.fc = nn.Linear(num_ftrs, label_batch.shape[1])
+
+    model = torchvision.models.densenet121()
+    print(model)
+    num_fltr = model.classifier.in_features
+    model.classifier = nn.Linear(num_fltr, label_batch.shape[1])
     
+    print(model)
     model = torch.nn.DataParallel(model)
     model.cuda()
    

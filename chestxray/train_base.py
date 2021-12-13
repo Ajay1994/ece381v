@@ -60,7 +60,7 @@ parser.add_argument('--compressionRate', type=int, default=1, help='Compression 
 # ############################### Misc ###############################
 parser.add_argument('--manualSeed', type=int, default=5094, help='manual seed')
 parser.add_argument('-e', '--evaluate', dest='evaluate', action='store_true', help='evaluate model on validation set')
-parser.add_argument('--save_dir', default='resnet18/', type=str)
+parser.add_argument('--save_dir', default='chest_resent18/', type=str)
 
 
 # ############################### Device Option ###############################
@@ -68,7 +68,8 @@ parser.add_argument('--gpu-id', default='0', type=str, help='id(s) for CUDA_VISI
 
 args = parser.parse_args()
 state = {k: v for k, v in args._get_kwargs()}
-os.environ["CUDA_VISIBLE_DEVICES"] = '2,3'
+os.environ["CUDA_VISIBLE_DEVICES"] = '0,1,2,3'
+
 
 
 use_cuda = torch.cuda.is_available()
@@ -90,16 +91,17 @@ def main():
     # ############################### Dataset ###############################
     print('==> Preparing dataset %s' % args.dataset)
     dataloaders = get_data_models(args)
-    img_batch, label_batch = next(iter(dataloaders["train"]))
+    index_batch, img_batch, label_batch = next(iter(dataloaders["train"]))
     print("Data Loaded: {} | {}".format(img_batch.shape, label_batch.shape))
     
+#     sys.exit(0)
     # ############################### Model ###############################
     if args.arch == "resnet18":
         model = torchvision.models.resnet18()
         num_ftrs = model.fc.in_features
         model.fc = nn.Linear(num_ftrs, label_batch.shape[1])
     elif args.arch == "resnet50":
-        model = torchvision.models.resnet50()
+        model = torchvision.models.resnet50(pretrained=True)
         num_ftrs = model.fc.in_features
         model.fc = nn.Linear(num_ftrs, label_batch.shape[1])
     
@@ -107,7 +109,7 @@ def main():
     model.cuda()
    
     # ############################### Optimizer and Loss ###############################
-    criterion = nn.CrossEntropyLoss()
+    criterion = nn.BCEWithLogitsLoss()
     optimizer = optim.SGD(model.parameters(), lr=args.lr,
                           momentum=args.momentum, weight_decay=args.weight_decay)
     
@@ -151,6 +153,10 @@ def main():
         print(" Valid : Precision : {} || Recall : {} || F1-Score : {} ".format(precision, recall, f1_score))
         score += str(f1_score) + "\t"
         
+        precision, recall, f1_score = test(dataloaders["test"], model, criterion, epoch, use_cuda)
+        print(" Test : Precision : {} || Recall : {} || F1-Score : {} ".format(precision, recall, f1_score))
+        score += str(f1_score) + "\n"
+        
         if f1_score > best_f1:
             save_checkpoint({
                 'epoch': epoch + 1,
@@ -162,15 +168,12 @@ def main():
             }, True, checkpoint=args.save_dir)
             best_f1 = f1_score
             
-        precision, recall, f1_score = test(dataloaders["test"], model, criterion, epoch, use_cuda)
-        print(" Test : Precision : {} || Recall : {} || F1-Score : {} ".format(precision, recall, f1_score))
-        score += str(f1_score) + "\n"
+        
         fopen2.write(score)
         fopen2.flush()
         
         fopen.write(" Test : Precision : {} || Recall : {} || F1-Score : {} \n".format(precision, recall, f1_score))
         fopen.flush()
-        
     # ################################### test ###################################
     print('Load best model ...')
     checkpoint = torch.load(os.path.join(args.save_dir, 'model_best.pth.tar'))
@@ -198,9 +201,9 @@ def train(trainloader, model, criterion, optimizer, epoch, use_cuda):
     end = time.time()
     bar = Bar('Processing', max=len(trainloader))
     print(args)
-    for batch_idx, (inputs, targets) in enumerate(trainloader):
+    for batch_idx, (index, inputs, targets) in enumerate(trainloader):
         data_time.update(time.time() - end)
-        targets = torch.max(targets, 1)[1]
+#         targets = torch.max(targets, 1)[1]
         
         if use_cuda:
             inputs, targets = inputs.cuda(), targets.cuda()
@@ -212,13 +215,16 @@ def train(trainloader, model, criterion, optimizer, epoch, use_cuda):
         loss = criterion(outputs, targets.data)
         losses.update(loss.item(), inputs.size(0))
         
-        gt = torch.cat((gt, targets.data))
-        pred = torch.cat((pred, outputs.data.topk(1)[1].squeeze(1)), 0)
-        
         # compute gradient and do SGD step
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
+        
+        out = torch.sigmoid(outputs.data)
+        out = (out > 0.5)
+        
+        gt = torch.cat((gt, targets.data), 0)
+        pred = torch.cat((pred, out), 0)
 
         # measure elapsed time
         batch_time.update(time.time() - end)
@@ -236,8 +242,7 @@ def train(trainloader, model, criterion, optimizer, epoch, use_cuda):
                     )
         bar.next()
     bar.finish()
-#     print(gt.shape, pred.shape)
-#     print(precision_recall_fscore_support(gt.cpu(), pred.cpu(), average = None)[2])
+    
     scores = precision_recall_fscore_support(gt.cpu(), pred.cpu(), average = "weighted", zero_division = 0)
     return scores[0], scores[1], scores[2]
         
@@ -254,9 +259,8 @@ def test(testloader, model, criterion, epoch, use_cuda):
     end = time.time()
     bar = Bar('Processing', max=len(testloader))
     with torch.no_grad():
-        for batch_idx, (inputs, targets) in enumerate(testloader):
+        for batch_idx, (index, inputs, targets) in enumerate(testloader):
             data_time.update(time.time() - end)
-            targets = torch.max(targets, 1)[1]
 
             if use_cuda:
                 inputs, targets = inputs.cuda(), targets.cuda()
@@ -266,9 +270,12 @@ def test(testloader, model, criterion, epoch, use_cuda):
             loss = criterion(outputs, targets)
             losses.update(loss.item(), inputs.size(0))
             
-            gt = torch.cat((gt, targets.data))
-            pred = torch.cat((pred, outputs.data.topk(1)[1].squeeze(1)), 0)
-
+            out = torch.sigmoid(outputs.data)
+            out = (out > 0.5)
+        
+            gt = torch.cat((gt, targets.data), 0)
+            pred = torch.cat((pred, out), 0)
+            
             # measure elapsed time
             batch_time.update(time.time() - end)
             end = time.time()

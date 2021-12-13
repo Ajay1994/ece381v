@@ -1,10 +1,10 @@
-#python train_base.py --arch resnet18 --save_dir resnet18/
 import argparse
 import os
 import random
 import shutil
 import time
 import sys
+import numpy as np
 
 import torch
 import torch.nn as nn
@@ -17,10 +17,10 @@ import torchvision.datasets as datasets
 
 from utils.prepare_data import get_data_models
 from utils.misc import save_checkpoint, AverageMeter
-
+from sklearn.metrics import roc_auc_score
 from progress.bar import Bar as Bar
 import matplotlib.pyplot as plt
-
+from sklearn.metrics import classification_report
 from sklearn.metrics import precision_recall_fscore_support
 
 # ############################### Parameters ###############################
@@ -31,7 +31,7 @@ parser.add_argument('-d', '--dataset', default='Lesion', type=str)
 parser.add_argument('-j', '--workers', default=4, type=int, metavar='N', help='number of data loading workers (default: 4)')
 
 # ############################### Optimization Option ###############################
-parser.add_argument('--epochs', default=100, type=int, metavar='N', help='number of total epochs to run')
+parser.add_argument('--epochs', default=40, type=int, metavar='N', help='number of total epochs to run')
 parser.add_argument('--start_epoch', default=0, type=int, metavar='N', help='manual epoch number (useful on restarts)')
 parser.add_argument('--train_batch', default=128, type=int, metavar='N', help='train batchsize')
 parser.add_argument('--test_batch', default=128, type=int, metavar='N', help='test batchsize')
@@ -44,7 +44,7 @@ parser.add_argument('--weight-decay', '--wd', default=2e-4, type=float, metavar=
 
 
 # ############################### Checkpoints ###############################
-parser.add_argument('--resume', default='', type=str, metavar='PATH', help='path to latest checkpoint (default: none)')
+parser.add_argument('--resume', default='./chest_resent50/model_best.pth.tar', type=str, metavar='PATH', help='path to latest checkpoint (default: none)')
 
 
 # ############################### Architecture ###############################
@@ -68,7 +68,7 @@ parser.add_argument('--gpu-id', default='0', type=str, help='id(s) for CUDA_VISI
 
 args = parser.parse_args()
 state = {k: v for k, v in args._get_kwargs()}
-os.environ["CUDA_VISIBLE_DEVICES"] = '2,3'
+os.environ["CUDA_VISIBLE_DEVICES"] = '0,1,2,3'
 
 
 use_cuda = torch.cuda.is_available()
@@ -85,12 +85,10 @@ def main():
     global best_acc
     start_epoch = args.start_epoch  # start from epoch 0 or last checkpoint epoch
 
-    os.makedirs(args.save_dir, exist_ok=True)
-
     # ############################### Dataset ###############################
     print('==> Preparing dataset %s' % args.dataset)
     dataloaders = get_data_models(args)
-    img_batch, label_batch = next(iter(dataloaders["train"]))
+    index, img_batch, label_batch = next(iter(dataloaders["train"]))
     print("Data Loaded: {} | {}".format(img_batch.shape, label_batch.shape))
     
     # ############################### Model ###############################
@@ -107,139 +105,23 @@ def main():
     model.cuda()
    
     # ############################### Optimizer and Loss ###############################
-    criterion = nn.CrossEntropyLoss()
+    criterion = nn.BCEWithLogitsLoss()
     optimizer = optim.SGD(model.parameters(), lr=args.lr,
                           momentum=args.momentum, weight_decay=args.weight_decay)
     
     # ############################### Resume ###############################
     title = args.dataset + "-" + args.arch
-    if args.resume:
-        print('==> Resuming from checkpoint..')
-        assert os.path.isfile(args.resume), 'Error: no checkpoint directory found!'
-        checkpoint = torch.load(args.resume)
-        best_f1 = checkpoint['f1_score']
-        start_epoch = checkpoint['epoch']
-        model.load_state_dict(checkpoint['state_dict'])
-        optimizer.load_state_dict(checkpoint['optimizer'])
-        print("Best F1-Score : {}".format(best_f1)) # Valid : Precision : 0.7257768869054372 || Recall : 0.7616580310880829 || F1-Score : 0.7397434352609674
-        
-    # evaluate with random initialization parameters
-    if args.evaluate:
-        print('\nEvaluation only')
-        precision, recall, f1_score = test(dataloaders["val"], model, criterion, -1, use_cuda)
-        print(" Valid : Precision : {} || Recall : {} || F1-Score : {} ".format(precision, recall, f1_score))
-        return
-
-    # save random initialization parameters
-    save_checkpoint({'state_dict': model.state_dict()}, False, checkpoint=args.save_dir, filename='init.pth.tar')
-    
-    # ############################### Train and val ###############################
-    best_f1 = 0.0
-    fopen = open(args.save_dir + "log_dir.txt", "w")
-    fopen2 = open(args.save_dir + "logger.txt", "w")
-    for epoch in range(start_epoch, args.epochs):
-        adjust_learning_rate(optimizer, epoch)
-
-        print('\nEpoch: [%d | %d] LR: %f' % (epoch + 1, args.epochs, state['lr']))
-        score = ""
-        
-        precision, recall, f1_score  = train(dataloaders["train"], model, criterion, optimizer, epoch, use_cuda)
-        print(" Train : Precision : {} || Recall : {} || F1-Score : {} ".format(precision, recall, f1_score))
-        score += str(f1_score) + "\t"
-        
-        precision, recall, f1_score = test(dataloaders["val"], model, criterion, epoch, use_cuda)
-        print(" Valid : Precision : {} || Recall : {} || F1-Score : {} ".format(precision, recall, f1_score))
-        score += str(f1_score) + "\t"
-        
-        if f1_score > best_f1:
-            save_checkpoint({
-                'epoch': epoch + 1,
-                'state_dict': model.state_dict(),
-                'f1_score': f1_score,
-                'prec': precision,
-                'recall': recall,
-                'optimizer' : optimizer.state_dict(),
-            }, True, checkpoint=args.save_dir)
-            best_f1 = f1_score
-            
-        precision, recall, f1_score = test(dataloaders["test"], model, criterion, epoch, use_cuda)
-        print(" Test : Precision : {} || Recall : {} || F1-Score : {} ".format(precision, recall, f1_score))
-        score += str(f1_score) + "\n"
-        fopen2.write(score)
-        fopen2.flush()
-        
-        fopen.write(" Test : Precision : {} || Recall : {} || F1-Score : {} \n".format(precision, recall, f1_score))
-        fopen.flush()
-        
-    # ################################### test ###################################
-    print('Load best model ...')
-    checkpoint = torch.load(os.path.join(args.save_dir, 'model_best.pth.tar'))
+    print('==> Resuming from checkpoint..')
+    print(args.resume)
+    assert os.path.isfile(args.resume), 'Error: no checkpoint directory found!'
+    checkpoint = torch.load(args.resume)
+    start_epoch = checkpoint['epoch']
     model.load_state_dict(checkpoint['state_dict'])
-    print("-"*100)
-    precision, recall, f1_score = test(dataloaders["test"], model, criterion, epoch, use_cuda)
+    optimizer.load_state_dict(checkpoint['optimizer'])
+#     print("Best F1-Score : {}".format(best_f1)) # Valid : Precision : 0.7257768869054372 || Recall : 0.7616580310880829 || F1-Score : 0.7397434352609674
+    precision, recall, f1_score = test(dataloaders["test"], model, criterion, -1, use_cuda)
     print(" Valid : Precision : {} || Recall : {} || F1-Score : {} ".format(precision, recall, f1_score))
-    fopen.write("-"*50)
-    fopen.write("\n Valid : Precision : {} || Recall : {} || F1-Score : {} \n".format(precision, recall, f1_score))
     
-    
-    fopen.close()
-    fopen2.close()
-    
-def train(trainloader, model, criterion, optimizer, epoch, use_cuda):
-    model.train()
-    
-    batch_time = AverageMeter()
-    data_time = AverageMeter()
-    losses = AverageMeter()
-    
-    gt = torch.FloatTensor().cuda()
-    pred = torch.FloatTensor().cuda()
-    
-    end = time.time()
-    bar = Bar('Processing', max=len(trainloader))
-    print(args)
-    for batch_idx, (inputs, targets) in enumerate(trainloader):
-        data_time.update(time.time() - end)
-        targets = torch.max(targets, 1)[1]
-        
-        if use_cuda:
-            inputs, targets = inputs.cuda(), targets.cuda()
-        inputs, targets = torch.autograd.Variable(inputs), torch.autograd.Variable(targets)
-        
-        
-            
-        outputs = model(inputs)
-        loss = criterion(outputs, targets.data)
-        losses.update(loss.item(), inputs.size(0))
-        
-        gt = torch.cat((gt, targets.data))
-        pred = torch.cat((pred, outputs.data.topk(1)[1].squeeze(1)), 0)
-        
-        # compute gradient and do SGD step
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
-
-        # measure elapsed time
-        batch_time.update(time.time() - end)
-        end = time.time()
-        
-        # plot progress
-        bar.suffix = '({batch}/{size}) Data: {data:.3f}s | Batch: {bt:.3f}s | Total: {total:} | ETA: {eta:} | Loss: {loss:.4f} '.format(
-                    batch=batch_idx + 1,
-                    size=len(trainloader),
-                    data=data_time.avg,
-                    bt=batch_time.avg,
-                    total=bar.elapsed_td,
-                    eta=bar.eta_td,
-                    loss=losses.avg,
-                    )
-        bar.next()
-    bar.finish()
-#     print(gt.shape, pred.shape)
-#     print(precision_recall_fscore_support(gt.cpu(), pred.cpu(), average = None)[2])
-    scores = precision_recall_fscore_support(gt.cpu(), pred.cpu(), average = "weighted", zero_division = 0)
-    return scores[0], scores[1], scores[2]
         
 def test(testloader, model, criterion, epoch, use_cuda):
     model.eval()
@@ -254,9 +136,8 @@ def test(testloader, model, criterion, epoch, use_cuda):
     end = time.time()
     bar = Bar('Processing', max=len(testloader))
     with torch.no_grad():
-        for batch_idx, (inputs, targets) in enumerate(testloader):
+        for batch_idx, (index, inputs, targets) in enumerate(testloader):
             data_time.update(time.time() - end)
-            targets = torch.max(targets, 1)[1]
 
             if use_cuda:
                 inputs, targets = inputs.cuda(), targets.cuda()
@@ -267,7 +148,7 @@ def test(testloader, model, criterion, epoch, use_cuda):
             losses.update(loss.item(), inputs.size(0))
             
             gt = torch.cat((gt, targets.data))
-            pred = torch.cat((pred, outputs.data.topk(1)[1].squeeze(1)), 0)
+            pred = torch.cat((pred, outputs.data), 0)
 
             # measure elapsed time
             batch_time.update(time.time() - end)
@@ -285,10 +166,27 @@ def test(testloader, model, criterion, epoch, use_cuda):
                         )
             bar.next()
     bar.finish()
+    
+    mean_auc, AUCs = compute_AUCs(gt, pred)
+    print("Mean AUC : {:.3f}".format(mean_auc))
+    print(AUCs)
+    
+    pred = torch.sigmoid(pred)
+    pred = (pred > 0.25)
     scores = precision_recall_fscore_support(gt.cpu(), pred.cpu(), average = "weighted", zero_division = 0)
+    
+#     print(classification_report(gt.cpu(), pred.cpu(), target_names=["MEL","NV","BCC","AK","BKL","DF","VASC","SCC"]))
     return scores[0], scores[1], scores[2]
         
-    
+
+def compute_AUCs(gt, pred):
+    AUROCs = []
+    gt_np = gt.cpu().numpy()
+    pred_np = pred.cpu().numpy()
+    for i in range(14):
+        AUROCs.append(roc_auc_score(gt_np[:, i], pred_np[:, i]))
+    return np.array(AUROCs).mean(), AUROCs
+
 def adjust_learning_rate(optimizer, epoch):
     global state
     if epoch in args.schedule:
